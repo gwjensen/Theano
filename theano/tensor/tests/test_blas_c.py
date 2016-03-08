@@ -12,7 +12,6 @@ from theano.tensor.blas_scipy import ScipyGer
 from theano.tensor.blas import Ger
 
 from theano.tensor.blas_c import CGemv
-from theano.tensor.blas_scipy import ScipyGer
 from theano.tensor.blas import Gemv
 
 from theano.tensor.blas_c import check_force_gemv_init
@@ -255,6 +254,22 @@ class TestCGemv(TestCase, TestOptimizationMixin):
         self.assertRaises(ValueError, f, A_val, ones_4, ones_5)
         self.assertRaises(ValueError, f, A_val, ones_3, ones_6)
         self.assertRaises(ValueError, f, A_val, ones_4, ones_6)
+
+    def test_multiple_inplace(self):
+        x = tensor.dmatrix('x')
+        y = tensor.dvector('y')
+        z = tensor.dvector('z')
+        f = theano.function([x, y, z],
+                            [tensor.dot(y, x), tensor.dot(z,x)],
+                            mode=mode_blas_opt)
+        vx = numpy.random.rand(3, 3)
+        vy = numpy.random.rand(3)
+        vz = numpy.random.rand(3)
+        out = f(vx, vy, vz)
+        assert numpy.allclose(out[0], numpy.dot(vy, vx))
+        assert numpy.allclose(out[1], numpy.dot(vz, vx))
+        assert len([n for n in f.maker.fgraph.apply_nodes
+                    if isinstance(n.op, tensor.AllocEmpty)]) == 2
 
 
 class TestCGemvFloat32(TestCase, BaseGemv, TestOptimizationMixin):
