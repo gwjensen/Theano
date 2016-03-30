@@ -17,7 +17,7 @@
 #include "cnmem.cpp"
 
 //If true, when there is a gpu malloc or free error, we print the size of allocated memory on the device.
-#define COMPUTE_GPU_MEM_USED 0
+#define COMPUTE_GPU_MEM_USED 1
 
 //If true, we fill with NAN allocated device memory.
 #define ALLOC_MEMSET 0
