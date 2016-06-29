@@ -1,22 +1,24 @@
-from __future__ import print_function
-import copy
+from __future__ import absolute_import, print_function, division
 import os
 import logging
-_logger = logging.getLogger(__name__)
-
+from six import integer_types
+from six.moves import StringIO, reduce
 import theano
 from theano import Apply
 from theano import tensor
-from six.moves import StringIO, reduce
 from theano.sandbox.cuda.type import CudaNdarrayType
 from theano.sandbox.cuda import GpuOp
 from theano.sandbox.cuda.basic_ops import (as_cuda_ndarray_variable,
                                            gpu_contiguous)
 from theano.tensor import as_tensor_variable
+_logger = logging.getLogger(__name__)
 
 
 class GpuBatchedDot(GpuOp):
-    __props__ = ()
+    __props__ = ("stream_threshold",)
+
+    def __init__(self, stream_threshold=650):
+        self.stream_threshold = stream_threshold
 
     def make_node(self, inp1, inp2):
         inp1 = gpu_contiguous(as_cuda_ndarray_variable(inp1))
@@ -24,11 +26,11 @@ class GpuBatchedDot(GpuOp):
 
         assert inp1.dtype == "float32"
         assert inp2.dtype == "float32"
-        assert inp1.ndim == 3 # (batch, a, b)
+        assert inp1.ndim == 3  # (batch, a, b)
         assert inp2.ndim == 3
 
         return theano.Apply(self, [inp1, inp2],
-                           [self.output_type(inp1, inp2)()])
+                            [self.output_type(inp1, inp2)()])
 
     def output_type(self, inp1, inp2):
         return CudaNdarrayType(
@@ -39,79 +41,83 @@ class GpuBatchedDot(GpuOp):
         bx, by = input_names
         bz, = output_names
         fail = sub['fail']
-        return """
-        float alpha = 1.0;
-        float beta = 0.0;
+        threshold = self.stream_threshold
+        return ("""
+        float alpha = 1.0, beta = 0.0;
 
-        int i, x_dim0, x_dim1, x_dim2, y_dim0, y_dim1, y_dim2;
-        int x_stride, y_stride, z_stride, total_size;
-        int ptr_array_size = 3 * CudaNdarray_HOST_DIMS(%(bx)s)[0] * sizeof(float *);
-        int out_dim[3];
+        const int* Nx = CudaNdarray_HOST_DIMS(%(bx)s);
+        const int* Ny = CudaNdarray_HOST_DIMS(%(by)s);
+        int Nz[3] = {0};
 
-        cublasStatus_t err;
-        cudaError_t err1;
+        // use parallel cublasSgemm calls rather than cublasSgemmBatched for large products
+        // (compute products in double because they can be large and we don't need to be exact)
+        bool use_cublas_sgemm_batched = (
+            double(Nx[1]) * double(Nx[2]) * double(Ny[2]) <
+            double(%(threshold)s) * double(%(threshold)s) * double(%(threshold)s));
 
-        float **host_x = NULL;
-        float **host_z = NULL;
-        float **host_y = NULL;
-
-        float **gpu_x = NULL;
-        float **gpu_y = NULL;
-        float **gpu_z = NULL;
-
-        x_dim0 = CudaNdarray_HOST_DIMS(%(bx)s)[0];
-        x_dim1 = CudaNdarray_HOST_DIMS(%(bx)s)[1];
-        x_dim2 = CudaNdarray_HOST_DIMS(%(bx)s)[2];
-
-        y_dim0 = CudaNdarray_HOST_DIMS(%(by)s)[0];
-        y_dim1 = CudaNdarray_HOST_DIMS(%(by)s)[1];
-        y_dim2 = CudaNdarray_HOST_DIMS(%(by)s)[2];
-
-        if (x_dim0 != y_dim0)
-        {
+        if (Nx[0] != Ny[0]) {
             PyErr_Format(PyExc_RuntimeError,
                     "The batchsizes (%%d, %%d) don't match.\\n",
-                    x_dim0, x_dim1);
+                    Nx[0], Ny[0]);
             %(fail)s;
         }
 
-        if (x_dim2 != y_dim1)
-        {
+        if (Nx[2] != Ny[1]) {
             PyErr_Format(PyExc_RuntimeError,
                     "Shape mismatch. (%%d, %%d, %%d) (%%d, %%d, %%d)\\n",
-                    x_dim0, x_dim1, x_dim2, y_dim0, y_dim1, y_dim2);
+                    Nx[0], Nx[1], Nx[2], Ny[0], Ny[1], Ny[2]);
             %(fail)s;
         }
 
-        out_dim[0] = x_dim0;
-        out_dim[1] = x_dim1;
-        out_dim[2] = y_dim2;
+        Nz[0] = Nx[0];
+        Nz[1] = Nx[1];
+        Nz[2] = Ny[2];
 
         if ( !(%(bz)s
                && %(bz)s->nd==3
                && CudaNdarray_is_c_contiguous(%(bz)s)
-               && CudaNdarray_HOST_DIMS(%(bz)s)[0]==out_dim[0]
-               && CudaNdarray_HOST_DIMS(%(bz)s)[1]==out_dim[1]
-               && CudaNdarray_HOST_DIMS(%(bz)s)[2]==out_dim[2]))
+               && CudaNdarray_HOST_DIMS(%(bz)s)[0] == Nz[0]
+               && CudaNdarray_HOST_DIMS(%(bz)s)[1] == Nz[1]
+               && CudaNdarray_HOST_DIMS(%(bz)s)[2] == Nz[2]))
         {
             Py_XDECREF(%(bz)s);
-            %(bz)s = (CudaNdarray*)CudaNdarray_NewDims(3,out_dim);
-            if (NULL == %(bz)s)
-            {
+            %(bz)s = (CudaNdarray*)CudaNdarray_NewDims(3, Nz);
+            if (NULL == %(bz)s) {
                 PyErr_Format(PyExc_RuntimeError,
                         "Failed to allocate output of %%d x %%d x %%d",
-                        out_dim[0], out_dim[1], out_dim[2]);
+                        Nz[0], Nz[1], Nz[2]);
                 %(fail)s;
             }
         }
 
-        if (x_dim0 != 0 && y_dim0 != 0 &&
-            x_dim1 != 0 && y_dim1 != 0 &&
-            x_dim2 != 0 && y_dim2 != 0)
+        if (Nx[0] == 0 || Nx[1] == 0 || Nx[2] == 0 ||
+            Ny[0] == 0 || Ny[1] == 0 || Ny[2] == 0)
         {
-            x_stride = CudaNdarray_HOST_STRIDES(%(bx)s)[0];
-            y_stride = CudaNdarray_HOST_STRIDES(%(by)s)[0];
-            z_stride = CudaNdarray_HOST_STRIDES(%(bz)s)[0];
+            const int total_size = Nz[0] * Nz[1] * Nz[2] * sizeof(float);
+            if (cudaSuccess != cudaMemset(CudaNdarray_DEV_DATA(%(bz)s), 0, total_size))
+            {
+                PyErr_Format(PyExc_RuntimeError,
+                        "Failed to fill output with zeros");
+                %(fail)s;
+            }
+        }
+        else if (use_cublas_sgemm_batched)
+        {
+            cublasStatus_t err;
+            cudaError_t err1;
+
+            float **host_x = NULL;
+            float **host_z = NULL;
+            float **host_y = NULL;
+
+            float **gpu_x = NULL;
+            float **gpu_y = NULL;
+            float **gpu_z = NULL;
+
+            const int ptr_array_size = 3 * Nx[0] * sizeof(float *);
+            const int x_stride = CudaNdarray_HOST_STRIDES(%(bx)s)[0];
+            const int y_stride = CudaNdarray_HOST_STRIDES(%(by)s)[0];
+            const int z_stride = CudaNdarray_HOST_STRIDES(%(bz)s)[0];
 
             host_x = (float **) malloc (ptr_array_size);
 
@@ -123,14 +129,14 @@ class GpuBatchedDot(GpuOp):
                 %(fail)s;
             }
 
-            host_y = &host_x[x_dim0];
-            host_z = &host_y[x_dim0];
+            host_y = &host_x[Nx[0]];
+            host_z = &host_y[Nx[0]];
 
             host_x[0] = CudaNdarray_DEV_DATA(%(bx)s);
             host_y[0] = CudaNdarray_DEV_DATA(%(by)s);
             host_z[0] = CudaNdarray_DEV_DATA(%(bz)s);
 
-            for (i = 1; i < out_dim[0]; i++)
+            for (int i = 1; i < Nz[0]; i++)
             {
                 host_x[i] = host_x[i - 1] + x_stride;
                 host_y[i] = host_y[i - 1] + y_stride;
@@ -143,8 +149,8 @@ class GpuBatchedDot(GpuOp):
                 %(fail)s;
             }
 
-            gpu_y = &gpu_x[x_dim0];
-            gpu_z = &gpu_y[x_dim0];
+            gpu_y = &gpu_x[Nx[0]];
+            gpu_z = &gpu_y[Nx[0]];
 
             err1 = cudaMemcpy(gpu_x, host_x, ptr_array_size, cudaMemcpyHostToDevice);
 
@@ -157,13 +163,14 @@ class GpuBatchedDot(GpuOp):
             }
 
             err = cublasSgemmBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                               y_dim2, x_dim1, x_dim2, &alpha,
-                               (const float **) gpu_y, y_dim2,
-                               (const float **) gpu_x, x_dim2, &beta,
-                               gpu_z, y_dim2, x_dim0);
+                                     Ny[2], Nx[1], Nx[2], &alpha,
+                                     (const float **) gpu_y, Ny[2],
+                                     (const float **) gpu_x, Nx[2],
+                                     &beta, gpu_z, Ny[2], Nx[0]);
+
+            CNDA_THREAD_SYNC;
 
             CLEANUP();
-
             if (CUBLAS_STATUS_SUCCESS != err)
             {
                 PyErr_Format(PyExc_RuntimeError,
@@ -171,19 +178,127 @@ class GpuBatchedDot(GpuOp):
                              err,  cublasGetErrorString(err));
                 %(fail)s;
             }
-        }
-        else
-        {
-            total_size = x_dim0 * x_dim1 * y_dim2 * sizeof(float);
-            if (cudaSuccess != cudaMemset(CudaNdarray_DEV_DATA(%(bz)s), 0, total_size))
+        } else {
+            // copy inputs if not contiguous
+            """ + ("\n".join("""
+             if ((   CudaNdarray_HOST_DIMS(%(var)s)[0] > 1 && CudaNdarray_HOST_STRIDES(%(var)s)[0] != 1
+                  && CudaNdarray_HOST_DIMS(%(var)s)[1] > 1 && CudaNdarray_HOST_STRIDES(%(var)s)[1] != 1
+                  && CudaNdarray_HOST_DIMS(%(var)s)[2] > 1 && CudaNdarray_HOST_STRIDES(%(var)s)[2] != 1)
+                 || CudaNdarray_HOST_STRIDES(%(var)s)[0] < 0
+                 || CudaNdarray_HOST_STRIDES(%(var)s)[1] < 0
+                 || CudaNdarray_HOST_STRIDES(%(var)s)[2] < 0)
+             {
+                 CudaNdarray *_copy = (CudaNdarray*) CudaNdarray_Copy(%(var)s);
+                 if (!_copy)
+                     %(fail)s;
+                 Py_XDECREF(%(var)s);
+                 %(var)s = _copy;
+             }
+             """ % dict(var=var, fail=fail) for var in (bx, by))) + """
+
+            // fail if the output is not contiguous; we can't copy it because we
+            // need to write to the original memory
+            if ((   CudaNdarray_HOST_DIMS(%(bz)s)[0] > 1 && CudaNdarray_HOST_STRIDES(%(bz)s)[0] != 1
+                 && CudaNdarray_HOST_DIMS(%(bz)s)[1] > 1 && CudaNdarray_HOST_STRIDES(%(bz)s)[1] != 1
+                 && CudaNdarray_HOST_DIMS(%(bz)s)[2] > 1 && CudaNdarray_HOST_STRIDES(%(bz)s)[2] != 1)
+                || CudaNdarray_HOST_STRIDES(%(bz)s)[0] < 0
+                || CudaNdarray_HOST_STRIDES(%(bz)s)[1] < 0
+                || CudaNdarray_HOST_STRIDES(%(bz)s)[2] < 0)
             {
-                PyErr_Format(PyExc_RuntimeError,
-                        "Failed to fill output with zeros");
+                PyErr_Format(PyExc_AssertionError,
+                             "non-unit or negative stride in output arg %(bz)s (%%i, %%i, %%i) of shape (%%i, %%i, %%i)",
+                             CudaNdarray_HOST_STRIDES(%(bz)s)[0],
+                             CudaNdarray_HOST_STRIDES(%(bz)s)[1],
+                             CudaNdarray_HOST_STRIDES(%(bz)s)[2],
+                             CudaNdarray_HOST_DIMS(%(bz)s)[0],
+                             CudaNdarray_HOST_DIMS(%(bz)s)[1],
+                             CudaNdarray_HOST_DIMS(%(bz)s)[2]);
                 %(fail)s;
             }
-        }
 
-        """ % locals()
+            const int* Sx = CudaNdarray_HOST_STRIDES(%(bx)s);
+            const int* Sy = CudaNdarray_HOST_STRIDES(%(by)s);
+            const int* Sz = CudaNdarray_HOST_STRIDES(%(bz)s);
+
+            /* encode the stride structure of _x,_y,_z into a single integer. */
+            int unit = 0;
+            unit |= ((Sx[2] == 1 || Nx[2] == 1) ? 0x0 : (Sx[1] == 1 || Nx[1] == 1) ? 0x1 : 0x2) << 8;
+            unit |= ((Sy[2] == 1 || Ny[2] == 1) ? 0x0 : (Sy[1] == 1 || Ny[1] == 1) ? 0x1 : 0x2) << 4;
+            unit |= ((Sz[2] == 1 || Nz[2] == 1) ? 0x0 : (Sz[1] == 1 || Nz[1] == 1) ? 0x1 : 0x2) << 0;
+
+            /* create appropriate strides for malformed matrices that are row or column
+             * vectors, or empty matrices.
+             * In that case, the value of the stride does not really matter, but
+             * some versions of BLAS insist that:
+             *  - they are not smaller than the number of elements in the array,
+             *  - they are not 0.
+             */
+            int sx_1 = (Nx[1] > 1) ? Sx[1] : (Nx[2] + 1);
+            int sx_2 = (Nx[2] > 1) ? Sx[2] : (Nx[1] + 1);
+            int sy_1 = (Ny[1] > 1) ? Sy[1] : (Ny[2] + 1);
+            int sy_2 = (Ny[2] > 1) ? Sy[2] : (Ny[1] + 1);
+            int sz_1 = (Nz[1] > 1) ? Sz[1] : (Nz[2] + 1);
+            int sz_2 = (Nz[2] > 1) ? Sz[2] : (Nz[1] + 1);
+
+            cublasOperation_t N = CUBLAS_OP_N, T = CUBLAS_OP_T;
+            float* x = CudaNdarray_DEV_DATA(%(bx)s);
+            float* y = CudaNdarray_DEV_DATA(%(by)s);
+            float* z = CudaNdarray_DEV_DATA(%(bz)s);
+            float* xend = x + CudaNdarray_SIZE(%(bx)s);
+            float* yend = y + CudaNdarray_SIZE(%(by)s);
+            float* zend = z + CudaNdarray_SIZE(%(bz)s);
+
+            #define N_STREAMS 32
+            cudaStream_t streams[N_STREAMS];
+            for (int i = 0; i < N_STREAMS; i++) {
+                cudaStreamCreate(&streams[i]);
+            }
+
+            cudaStreamSynchronize(0);
+            for (int i = 0; i < Nx[0]; i++)
+            {
+                assert(CudaNdarray_DEV_DATA(%(bx)s) <= x); assert(x < CudaNdarray_DEV_DATA(%(bx)s) + CudaNdarray_SIZE(%(bx)s));
+                assert(CudaNdarray_DEV_DATA(%(by)s) <= y); assert(y < CudaNdarray_DEV_DATA(%(by)s) + CudaNdarray_SIZE(%(by)s));
+                assert(CudaNdarray_DEV_DATA(%(bz)s) <= z); assert(z < CudaNdarray_DEV_DATA(%(bz)s) + CudaNdarray_SIZE(%(bz)s));
+
+                cublasSetStream(handle, streams[i %% N_STREAMS]);
+                cublasStatus_t status;
+                switch(unit)
+                {
+                case 0x000: status = cublasSgemm(handle, N, N, Nz[2], Nz[1], Nx[2], &alpha, y, sy_1, x, sx_1, &beta, z, sz_1); break;
+                case 0x100: status = cublasSgemm(handle, N, T, Nz[2], Nz[1], Nx[2], &alpha, y, sy_1, x, sx_2, &beta, z, sz_1); break;
+                case 0x010: status = cublasSgemm(handle, T, N, Nz[2], Nz[1], Nx[2], &alpha, y, sy_2, x, sx_1, &beta, z, sz_1); break;
+                case 0x110: status = cublasSgemm(handle, T, T, Nz[2], Nz[1], Nx[2], &alpha, y, sy_2, x, sx_2, &beta, z, sz_1); break;
+                case 0x001: status = cublasSgemm(handle, T, T, Nz[1], Nz[2], Nx[2], &alpha, x, sx_1, y, sy_1, &beta, z, sz_2); break;
+                case 0x101: status = cublasSgemm(handle, N, T, Nz[1], Nz[2], Nx[2], &alpha, x, sx_2, y, sy_1, &beta, z, sz_2); break;
+                case 0x011: status = cublasSgemm(handle, T, N, Nz[1], Nz[2], Nx[2], &alpha, x, sx_1, y, sy_2, &beta, z, sz_2); break;
+                case 0x111: status = cublasSgemm(handle, N, N, Nz[1], Nz[2], Nx[2], &alpha, x, sx_2, y, sy_2, &beta, z, sz_2); break;
+                default: PyErr_Format(PyExc_ValueError, "some matrix has no unit stride (unit=%%x)", unit); %(fail)s;
+                }
+
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    PyErr_Format(PyExc_RuntimeError,
+                                 "cublasSgemm failed (%%i) %%s\\n"
+                                 " unit=%%x N=%%d,"
+                                 " x shape=[%%d %%d %%d], y shape=[%%d %%d %%d], z shape=[%%d %%d %%d]"
+                                 " x strides=[%%d %%d %%d], y strides=[%%d %%d %%d], z strides=[%%d %%d %%d]",
+                                 status,  cublasGetErrorString(status), unit, N,
+                                 Nx[0], Nx[1], Nx[2], Sx[0], Sx[1], Sx[2],
+                                 Ny[0], Ny[1], Ny[2], Sy[0], Sy[1], Sy[2],
+                                 Nz[0], Nz[1], Nz[2], Sz[0], Sz[1], Sz[2]);
+                    %(fail)s;
+                }
+
+                x += Sx[0]; y += Sy[0]; z += Sz[0];
+            };
+
+            cublasSetStream(handle, NULL);
+            for (int i = 0; i < N_STREAMS; i++) {
+                cudaStreamSynchronize(streams[i]);
+                cudaStreamDestroy(streams[i]);
+            }
+        }
+        """) % locals()
 
     def c_support_code(self):
         return """
@@ -199,8 +314,8 @@ class GpuBatchedDot(GpuOp):
         x, y = inp
         gz, = grads
 
-        xgrad = batched_dot(gz, y.dimshuffle(0, 2, 1))
-        ygrad = batched_dot(x.dimshuffle(0, 2, 1), gz)
+        xgrad = GpuBatchedDot(stream_threshold=self.stream_threshold)(gz, y.dimshuffle(0, 2, 1))
+        ygrad = GpuBatchedDot(stream_threshold=self.stream_threshold)(x.dimshuffle(0, 2, 1), gz)
 
         rval = xgrad, ygrad
 
@@ -210,7 +325,7 @@ class GpuBatchedDot(GpuOp):
         return rval
 
     def c_code_cache_version(self):
-        return (1,)
+        return (3,)
 
     def infer_shape(self, node, shapes):
         xshp, yshp = shapes
@@ -243,7 +358,7 @@ class GpuDot22(GpuOp):
         if y.type.ndim != 2:
             raise TypeError(y)
         otype = CudaNdarrayType(
-                (x.type.broadcastable[0], y.type.broadcastable[1]))
+            (x.type.broadcastable[0], y.type.broadcastable[1]))
         return Apply(self, [x, y], [otype()])
 
     def c_code_cache_version(self):
@@ -331,7 +446,7 @@ class GpuDot22Scalar(GpuOp):
         if not tensor.blas._as_scalar(a):
             raise TypeError(a)
         otype = CudaNdarrayType(
-                (x.type.broadcastable[0], y.type.broadcastable[1]))
+            (x.type.broadcastable[0], y.type.broadcastable[1]))
         return Apply(self, [x, y, a], [otype()])
 
     def c_code_cache_version(self):
@@ -417,8 +532,8 @@ class GpuGemm(GpuOp):
             return 'GpuGemm{no_inplace}'
 
     def __eq__(self, other):
-        return (type(self) == type(other)\
-                and self.inplace == other.inplace)
+        return (type(self) == type(other) and
+                self.inplace == other.inplace)
 
     def __hash__(self):
         return hash(type(self)) ^ hash(self.inplace)
@@ -442,7 +557,7 @@ class GpuGemm(GpuOp):
         return (4,)
 
     def c_code(self, node, name, inputs, outputs, sub):
-        #z_out = alpha * dot(x,y) + beta * z_in
+        # z_out = alpha * dot(x,y) + beta * z_in
         # inplace version, set set z_out = z_in
         # not inplace version, we copy z_in to z_out.
         z_in, a, x, y, b = inputs
@@ -537,8 +652,8 @@ class GpuGemv(GpuOp):
             return 'GpuGemv{no_inplace}'
 
     def __eq__(self, other):
-        return (type(self) == type(other)\
-                and self.inplace == other.inplace)
+        return (type(self) == type(other) and
+                self.inplace == other.inplace)
 
     def __hash__(self):
         return hash(type(self)) ^ hash(self.inplace)
@@ -562,7 +677,7 @@ class GpuGemv(GpuOp):
         return (3,)
 
     def c_code(self, node, name, inputs, outputs, sub):
-        #z_out = alpha * dot(x,y) + beta * z_in
+        # z_out = alpha * dot(x,y) + beta * z_in
         # inplace version, set set z_out = z_in
         # not inplace version, we copy z_in to z_out.
         z_in, a, x, y, b = inputs
@@ -637,8 +752,8 @@ class GpuGer(GpuOp):
             return 'GpuGer{no_inplace}'
 
     def __eq__(self, other):
-        return (type(self) == type(other)\
-                and self.inplace == other.inplace)
+        return (type(self) == type(other) and
+                self.inplace == other.inplace)
 
     def __hash__(self):
         return hash(type(self)) ^ hash(self.inplace)
@@ -662,7 +777,7 @@ class GpuGer(GpuOp):
         return (2,)
 
     def c_code(self, node, name, inputs, outputs, sub):
-        #z_out = alpha * dot(x,y) + beta * z_in
+        # z_out = alpha * dot(x,y) + beta * z_in
         # inplace version, set set z_out = z_in
         # not inplace version, we copy z_in to z_out.
         z_in, a, x, y = inputs
@@ -740,15 +855,17 @@ class BaseGpuCorrMM(GpuOp):
         or a pair of integers
     subsample
         Perform subsampling of the output (default: (1, 1)).
+    filter_dilation
+        Perform subsampling of the input, also known as dilation (default: (1, 1)).
     pad
         *deprecated*, now you should always use border_mode.
-
     """
 
     check_broadcast = False
-    __props__ = ('border_mode', 'subsample')
+    __props__ = ('border_mode', 'subsample', 'filter_dilation')
 
-    def __init__(self, border_mode="valid", subsample=(1, 1), pad=(0, 0)):
+    def __init__(self, border_mode="valid", subsample=(1, 1),
+                 filter_dilation=(1, 1), pad=(0, 0)):
         if pad != (0, 0):
             _logger.warning(
                 'do not use pad for BaseGpuCorrMM; please set padding in '
@@ -756,7 +873,7 @@ class BaseGpuCorrMM(GpuOp):
             if border_mode != "valid":
                 raise ValueError("border_mode must be 'valid' if pad is given")
             border_mode = pad
-        if isinstance(border_mode, int):
+        if isinstance(border_mode, integer_types):
             border_mode = (border_mode, border_mode)
         if isinstance(border_mode, tuple):
             pad_h, pad_w = map(int, border_mode)
@@ -770,7 +887,10 @@ class BaseGpuCorrMM(GpuOp):
         self.border_mode = border_mode
         if len(subsample) != 2:
             raise ValueError("subsample must have two elements")
-        self.subsample = subsample
+        if len(filter_dilation) != 2:
+            raise ValueError("filter_dilation must have two elements")
+        self.subsample = tuple(subsample)
+        self.filter_dilation = tuple(filter_dilation)
 
     @property
     def pad(self):
@@ -779,10 +899,11 @@ class BaseGpuCorrMM(GpuOp):
         return (0, 0)
 
     def __str__(self):
-        return '%s{%s, %s}' % (
+        return '%s{%s, %s, %s}' % (
             self.__class__.__name__,
             self.border_mode,
-            str(self.subsample))
+            str(self.subsample),
+            str(self.filter_dilation))
 
     def flops(self, inp, outp):
         """
@@ -807,14 +928,14 @@ class BaseGpuCorrMM(GpuOp):
 
     def c_code_cache_version(self):
         # raise this whenever modifying any of the support_code_files
-        return (0, 24)
+        return (0, 26)
 
     def c_support_code_apply(self, node, nodename):
         # REMEMBER TO RAISE c_code_cache_version when changing any of
         # these files
         files = ['corr_gemm.cu']
         codes = [open(os.path.join(os.path.split(__file__)[0], f)).read()
-                for f in files]
+                 for f in files]
         return reduce(str.__add__, codes)
 
     def c_code_helper(self, bottom, weights, top, direction, sub, height=None, width=None):
@@ -827,7 +948,7 @@ class BaseGpuCorrMM(GpuOp):
 
         Parameters
         ----------
-        bottom 
+        bottom
             Variable name of the input images in the forward pass,
             or the gradient of the input images in backprop wrt. inputs
         weights
@@ -861,6 +982,7 @@ class BaseGpuCorrMM(GpuOp):
 
         """
         dH, dW = self.subsample
+        dilH, dilW = self.filter_dilation
         if self.border_mode == "half":
             padH = padW = -1
         elif self.border_mode == "full":
@@ -881,7 +1003,7 @@ class BaseGpuCorrMM(GpuOp):
             out = bottom
         else:
             raise ValueError("direction must be one of 'forward', "
-                    "'backprop weights', 'backprop inputs'")
+                             "'backprop weights', 'backprop inputs'")
         # When subsampling, we cannot unambiguously infer the height and width
         # of bottom and weights from top, so we require them to be given.
         # Similarly, when pad="half", we cannot infer the weight size.
@@ -907,6 +1029,8 @@ class BaseGpuCorrMM(GpuOp):
     // Optional args
     int dH = %(dH)s;
     int dW = %(dW)s;
+    int dilH = %(dilH)s;
+    int dilW = %(dilW)s;
     int padH = %(padH)s;
     int padW = %(padW)s;
 
@@ -930,39 +1054,43 @@ class BaseGpuCorrMM(GpuOp):
         }
         else if (padH == -2) {
             // vertical full padding, we can infer the kernel height
-            kH = 2 - CudaNdarray_HOST_DIMS(bottom)[2] + (CudaNdarray_HOST_DIMS(top)[2] - 1) * dH;
+            kH = (2 - CudaNdarray_HOST_DIMS(bottom)[2] + (CudaNdarray_HOST_DIMS(top)[2] - 1)*dH - 1) / dilH + 1;
         }
         else {
             // explicit padding, we can infer the kernel height
-            kH = CudaNdarray_HOST_DIMS(bottom)[2] + 2*padH - (CudaNdarray_HOST_DIMS(top)[2] - 1) * dH;
+            kH = (CudaNdarray_HOST_DIMS(bottom)[2] + 2*padH - (CudaNdarray_HOST_DIMS(top)[2] - 1)*dH - 1) / dilH + 1 ;
         }
         if ((dW != 1) || (padW == -1)) {
             kW = %(width)s;
         }
         else if (padW == -2) {
-            kW = 2 - CudaNdarray_HOST_DIMS(bottom)[3] + (CudaNdarray_HOST_DIMS(top)[3] - 1) * dW;
+            kW = (2 - CudaNdarray_HOST_DIMS(bottom)[3] + (CudaNdarray_HOST_DIMS(top)[3] - 1) * dW - 1) / dilW + 1;
         }
         else {
-            kW = CudaNdarray_HOST_DIMS(bottom)[3] + 2*padW - (CudaNdarray_HOST_DIMS(top)[3] - 1) * dW;
+            kW = (CudaNdarray_HOST_DIMS(bottom)[3] + 2*padW - (CudaNdarray_HOST_DIMS(top)[3] - 1) * dW - 1) / dilW + 1;
         }
     }
 
+    // Implicit dilated kernel size
+    int dil_kH = (kH - 1) * dilH + 1;
+    int dil_kW = (kW - 1) * dilW + 1;
+
     // Auto-padding if requested
     if (padH == -1) {  // vertical half padding
-        padH = kH / 2;
+        padH = dil_kH / 2;
     }
     else if (padH == -2) {  // vertical full padding
-        padH = kH - 1;
+        padH = dil_kH - 1;
     }
     else if (padH < 0) {
         PyErr_SetString(PyExc_ValueError, "BaseGpuCorrMM: padH must be >= -2");
         %(fail)s
     }
     if (padW == -1) {  // horizontal half padding
-        padW = kW / 2;
+        padW = dil_kW / 2;
     }
     else if (padW == -2) {  // horizontal full padding
-        padW = kW - 1;
+        padW = dil_kW - 1;
     }
     else if (padW < 0) {
         PyErr_SetString(PyExc_ValueError, "BaseGpuCorrMM: padW must be >= -2");
@@ -974,15 +1102,15 @@ class BaseGpuCorrMM(GpuOp):
     switch(direction) {
     case 0:  // forward pass
         // output is top: (batchsize, num_filters, height, width)
-        // height and width: top = (bottom + 2*pad - weight) / sample + 1
+        // height and width: top = (bottom + 2*pad - ((weight-1)*dil + 1)) / sample + 1
         out_dim[0] = CudaNdarray_HOST_DIMS(bottom)[0];
         out_dim[1] = CudaNdarray_HOST_DIMS(weights)[0];
-        out_dim[2] = (CudaNdarray_HOST_DIMS(bottom)[2] + 2*padH - CudaNdarray_HOST_DIMS(weights)[2]) / dH + 1;
-        out_dim[3] = (CudaNdarray_HOST_DIMS(bottom)[3] + 2*padW - CudaNdarray_HOST_DIMS(weights)[3]) / dW + 1;
+        out_dim[2] = (CudaNdarray_HOST_DIMS(bottom)[2] + 2*padH - ((CudaNdarray_HOST_DIMS(weights)[2]-1)*dilH + 1)) / dH + 1;
+        out_dim[3] = (CudaNdarray_HOST_DIMS(bottom)[3] + 2*padW - ((CudaNdarray_HOST_DIMS(weights)[3]-1)*dilW + 1)) / dW + 1;
         break;
     case 1:  // backprop wrt. weights
         // output is weights: (num_filters, num_channels, height, width)
-        // height and width: weights = bottom + 2*pad - (top - 1) * sample
+        // height and width: weights = (bottom + 2*pad - (top - 1) * sample - 1) / dil + 1
         out_dim[0] = CudaNdarray_HOST_DIMS(top)[1];
         out_dim[1] = CudaNdarray_HOST_DIMS(bottom)[1];
         out_dim[2] = kH;  // already inferred further above
@@ -990,11 +1118,11 @@ class BaseGpuCorrMM(GpuOp):
         break;
     case 2:  // backprop wrt. inputs
         // output is bottom: (batchsize, num_channels, height, width)
-        // height and width: bottom = (top - 1) * sample + weights - 2*pad
+        // height and width: bottom = (top - 1) * sample + (weights-1)*dil + 1 - 2*pad
         out_dim[0] = CudaNdarray_HOST_DIMS(top)[0];
         out_dim[1] = CudaNdarray_HOST_DIMS(weights)[1];
-        out_dim[2] = (dH != 1) ? %(height)s : (CudaNdarray_HOST_DIMS(top)[2] - 1) * dH + CudaNdarray_HOST_DIMS(weights)[2] - 2*padH;
-        out_dim[3] = (dW != 1) ? %(width)s : (CudaNdarray_HOST_DIMS(top)[3] - 1) * dW + CudaNdarray_HOST_DIMS(weights)[3] - 2*padW;
+        out_dim[2] = (dH != 1) ? %(height)s : (CudaNdarray_HOST_DIMS(top)[2] - 1) * dH + (CudaNdarray_HOST_DIMS(weights)[2]-1)*dilH + 1 - 2*padH;
+        out_dim[3] = (dW != 1) ? %(width)s : (CudaNdarray_HOST_DIMS(top)[3] - 1) * dW + (CudaNdarray_HOST_DIMS(weights)[3]-1)*dilW + 1 - 2*padW;
         break;
     default:
         PyErr_SetString(PyExc_ValueError, "BaseGpuCorrMM: direction must be 0, 1, or 2\\n");
@@ -1022,7 +1150,7 @@ class BaseGpuCorrMM(GpuOp):
     }
 
     // Call CUDA code
-    out2 = corrMM(%(bottom)s, %(weights)s, %(top)s, direction, dH, dW, padH, padW);
+    out2 = corrMM(%(bottom)s, %(weights)s, %(top)s, direction, dH, dW, dilH, dilW, padH, padW);
     if (out2==NULL){
        %(fail)s
     }
@@ -1038,7 +1166,7 @@ class GpuCorrMM(BaseGpuCorrMM):
     Parameters
     ----------
     border_mode
-	The width of a border of implicit zeros to pad the
+        The width of a border of implicit zeros to pad the
         input with. Must be a tuple with 2 elements giving the numbers of rows
         and columns to pad on each side, or a single integer to pad the same
         on all sides, or a string shortcut setting the padding at runtime:
@@ -1053,8 +1181,12 @@ class GpuCorrMM(BaseGpuCorrMM):
         `(sv, sh)` is equivalent to `GpuCorrMM(...)(...)[:,:,::sv, ::sh]`,
         but faster.
         Set to `(1, 1)` to disable subsampling.
+    filter_dilation
+        The filter dilation operation applied to each input image.
+        Should be a tuple with 2 elements.
+        Set to `(1, 1)` to disable filter dilation.
     pad
-	Deprecated alias for `border_mode`.
+        Deprecated alias for `border_mode`.
 
     Notes
     -----
@@ -1083,8 +1215,10 @@ class GpuCorrMM(BaseGpuCorrMM):
     """
     def __init__(self, border_mode="valid",
                  subsample=(1, 1),
+                 filter_dilation=(1, 1),
                  pad=(0, 0)):
-        super(GpuCorrMM, self).__init__(border_mode, subsample, pad)
+        super(GpuCorrMM, self).__init__(border_mode, subsample,
+                                        filter_dilation, pad)
 
     def make_node(self, img, kern):
         img = as_cuda_ndarray_variable(img)
@@ -1108,9 +1242,13 @@ class GpuCorrMM(BaseGpuCorrMM):
         bottom, weights = inp
         top, = grads
         top = gpu_contiguous(top)
-        d_bottom = GpuCorrMM_gradInputs(self.border_mode, self.subsample)(
+        d_bottom = GpuCorrMM_gradInputs(self.border_mode,
+                                        self.subsample,
+                                        self.filter_dilation)(
             weights, top, bottom.shape[-2:])
-        d_weights = GpuCorrMM_gradWeights(self.border_mode, self.subsample)(
+        d_weights = GpuCorrMM_gradWeights(self.border_mode,
+                                          self.subsample,
+                                          self.filter_dilation)(
             bottom, top, weights.shape[-2:])
         return d_bottom, d_weights
 
@@ -1127,9 +1265,13 @@ class GpuCorrMM_gradWeights(BaseGpuCorrMM):
     """
 
     def __init__(self, border_mode="valid",
-            subsample=(1, 1),
-            pad=(0, 0)):
-        super(GpuCorrMM_gradWeights, self).__init__(border_mode, subsample, pad)
+                 subsample=(1, 1),
+                 filter_dilation=(1, 1),
+                 pad=(0, 0)):
+        super(GpuCorrMM_gradWeights, self).__init__(border_mode,
+                                                    subsample,
+                                                    filter_dilation,
+                                                    pad)
 
     def make_node(self, img, topgrad, shape=None):
         img = as_cuda_ndarray_variable(img)
@@ -1163,11 +1305,16 @@ class GpuCorrMM_gradWeights(BaseGpuCorrMM):
         bottom, top = inp[:2]
         weights, = grads
         weights = gpu_contiguous(weights)
-        d_bottom = GpuCorrMM_gradInputs(self.border_mode, self.subsample)(
-                weights, top, bottom.shape[-2:])
-        d_top = GpuCorrMM(self.border_mode, self.subsample)(
-                bottom, weights)
-        d_height_width = (theano.gradient.DisconnectedType()(),) * 2 if len(inp) == 4 else ()
+        d_bottom = GpuCorrMM_gradInputs(self.border_mode,
+                                        self.subsample,
+                                        self.filter_dilation)(weights,
+                                                              top,
+                                                              bottom.shape[-2:])
+        d_top = GpuCorrMM(
+            self.border_mode, self.subsample, self.filter_dilation)(bottom, weights)
+        d_height_width = (
+            theano.gradient.DisconnectedType()(),
+            ) * 2 if len(inp) == 4 else ()
         return (d_bottom, d_top) + d_height_width
 
     def connection_pattern(self, node):
@@ -1189,9 +1336,11 @@ class GpuCorrMM_gradInputs(BaseGpuCorrMM):
     """
 
     def __init__(self, border_mode="valid",
-            subsample=(1, 1),
-            pad=(0, 0)):
-        super(GpuCorrMM_gradInputs, self).__init__(border_mode, subsample, pad)
+                 subsample=(1, 1),
+                 filter_dilation=(1, 1),
+                 pad=(0, 0)):
+        super(GpuCorrMM_gradInputs, self).__init__(border_mode, subsample,
+                                                   filter_dilation, pad)
 
     def make_node(self, kern, topgrad, shape=None):
         kern = as_cuda_ndarray_variable(kern)
@@ -1222,11 +1371,17 @@ class GpuCorrMM_gradInputs(BaseGpuCorrMM):
         weights, top = inp[:2]
         bottom, = grads
         bottom = gpu_contiguous(bottom)
-        d_weights = GpuCorrMM_gradWeights(self.border_mode, self.subsample)(
-                bottom, top, weights.shape[-2:])
-        d_top = GpuCorrMM(self.border_mode, self.subsample)(
-                bottom, weights)
-        d_height_width = (theano.gradient.DisconnectedType()(),) * 2 if len(inp) == 4 else ()
+        d_weights = GpuCorrMM_gradWeights(self.border_mode,
+                                          self.subsample,
+                                          self.filter_dilation)(bottom,
+                                                                top,
+                                                                weights.shape[-2:])
+        d_top = GpuCorrMM(self.border_mode,
+                          self.subsample,
+                          self.filter_dilation)(bottom, weights)
+        d_height_width = (
+            theano.gradient.DisconnectedType()(),
+            ) * 2 if len(inp) == 4 else ()
         return (d_weights, d_top) + d_height_width
 
     def connection_pattern(self, node):
@@ -1292,7 +1447,7 @@ class BaseGpuCorr3dMM(GpuOp):
         # these files
         files = ['corr3d_gemm.cu']
         codes = [open(os.path.join(os.path.split(__file__)[0], f)).read()
-                for f in files]
+                 for f in files]
         return reduce(str.__add__, codes)
 
     def c_code_helper(self, bottom, weights,
@@ -1339,7 +1494,7 @@ class BaseGpuCorr3dMM(GpuOp):
             If self.pad == 'half', a variable giving the width of the filters
             for direction="backprop weights".
             Ignored otherwise.
-        depth 
+        depth
             If self.subsample[2] != 1, a variable giving the depth
             of the filters for direction="backprop weights" or the depth of the
             input images for direction="backprop inputs".
@@ -1368,7 +1523,7 @@ class BaseGpuCorr3dMM(GpuOp):
             out = bottom
         else:
             raise ValueError("direction must be one of 'forward', "
-                    "'backprop weights', 'backprop inputs'")
+                             "'backprop weights', 'backprop inputs'")
         # When subsampling, we cannot unambiguously infer the height and width
         # of bottom and weights from top, so we require them to be given.
         # Similarly, when pad="half", we cannot infer the weight size.
@@ -1635,10 +1790,16 @@ class GpuCorr3dMM(BaseGpuCorr3dMM):
         bottom, weights = inp
         top, = grads
         top = gpu_contiguous(top)
-        d_bottom = GpuCorr3dMM_gradInputs(self.border_mode, self.subsample, self.pad)(
-                weights, top, bottom.shape[-3:])
-        d_weights = GpuCorr3dMM_gradWeights(self.border_mode, self.subsample, self.pad)(
-                bottom, top, weights.shape[-3:])
+        d_bottom = GpuCorr3dMM_gradInputs(self.border_mode,
+                                          self.subsample,
+                                          self.pad)(weights,
+                                                    top,
+                                                    bottom.shape[-3:])
+        d_weights = GpuCorr3dMM_gradWeights(self.border_mode,
+                                            self.subsample,
+                                            self.pad)(bottom,
+                                                      top,
+                                                      weights.shape[-3:])
         return d_bottom, d_weights
 
 
@@ -1743,11 +1904,16 @@ class GpuCorr3dMM_gradInputs(BaseGpuCorr3dMM):
         weights, top = inp[:2]
         bottom, = grads
         bottom = gpu_contiguous(bottom)
-        d_weights = GpuCorr3dMM_gradWeights(self.border_mode, self.subsample, self.pad)(
-            bottom, top, weights.shape[-3:])
-        d_top = GpuCorr3dMM(self.border_mode, self.subsample, self.pad)(
-                bottom, weights)
-        d_height_width_depth = (theano.gradient.DisconnectedType()(),) * 3 if len(inp) == 5 else ()
+        d_weights = GpuCorr3dMM_gradWeights(self.border_mode,
+                                            self.subsample,
+                                            self.pad)(bottom,
+                                                      top,
+                                                      weights.shape[-3:])
+        d_top = GpuCorr3dMM(self.border_mode,
+                            self.subsample,
+                            self.pad)(bottom, weights)
+        d_height_width_depth = (theano.gradient.DisconnectedType()(),)\
+            * 3 if len(inp) == 5 else ()
         return (d_weights, d_top) + d_height_width_depth
 
     def connection_pattern(self, node):
@@ -1818,19 +1984,19 @@ class GpuConv(GpuOp):
         raise ValueError(mode)
 
     def __init__(self, border_mode,
-            subsample=(1, 1),
-            logical_img_hw=None,
-            logical_kern_hw=None,
-            logical_kern_align_top=True,
-            version=-1,
-            direction_hint=None,
-            verbose=0,
-            kshp=None,
-            imshp=None,
-            max_threads_dim0=None,
-            nkern=None,
-            bsize=None,
-            fft_opt=True):
+                 subsample=(1, 1),
+                 logical_img_hw=None,
+                 logical_kern_hw=None,
+                 logical_kern_align_top=True,
+                 version=-1,
+                 direction_hint=None,
+                 verbose=0,
+                 kshp=None,
+                 imshp=None,
+                 max_threads_dim0=None,
+                 nkern=None,
+                 bsize=None,
+                 fft_opt=True):
         self.border_mode = border_mode
         if version != -1:
             raise Exception(
@@ -1987,7 +2153,7 @@ class GpuConv(GpuOp):
         # these files
         files = ['conv_kernel.cu', 'conv_full_kernel.cu', 'conv.cu']
         codes = [open(os.path.join(os.path.split(__file__)[0], f)).read()
-                for f in files]
+                 for f in files]
         return reduce(str.__add__, codes)
 
     def c_code(self, node, nodename, inp, out_, sub):
@@ -2066,7 +2232,7 @@ class GpuDownsampleFactorMax(GpuOp):
         return Apply(self, [x], [x.type()])
 
     # def perform(self, node, input_storage, output_storage):
-        #raise NotImplementedError('only C is implemented')
+        # raise NotImplementedError('only C is implemented')
     def c_code_cache_version(self):
         return (6)
 

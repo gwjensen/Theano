@@ -124,7 +124,7 @@ If arguments to GEMM are dimshuffled vectors, then we can use GEMV
 instead. This optimization is `local_gemm_to_gemv`.
 
 """
-from __future__ import print_function
+from __future__ import absolute_import, print_function, division
 import copy
 import logging
 import os
@@ -152,6 +152,7 @@ from theano.tensor import basic as T
 from theano.tensor.blas_headers import blas_header_text
 from theano.tensor.blas_headers import blas_header_version
 from theano.tensor.opt import in2out, local_dimshuffle_lift
+from theano.tensor.type import values_eq_approx_remove_inf_nan
 
 _logger = logging.getLogger('theano.tensor.blas')
 
@@ -181,6 +182,24 @@ except ImportError as e:
                         'dot(matrix, vector), dot(vector, matrix) and '
                         'dot(vector, vector) (%s)',
                         str(e))
+
+
+# If check_init_y() == True we need to initialize y when beta == 0.
+def check_init_y():
+    if check_init_y._result is None:
+        if not have_fblas:
+            check_init_y._result = False
+
+        y = float('NaN') * numpy.ones((2,))
+        x = numpy.ones((2,))
+        A = numpy.ones((2, 2))
+        gemv = _blas_gemv_fns[y.dtype]
+        gemv(1.0, A.T, x, 0.0, y, overwrite_y=True, trans=True)
+        check_init_y._result = numpy.isnan(y).any()
+
+    return check_init_y._result
+
+check_init_y._result = None
 
 
 class Gemv(Op):
@@ -236,6 +255,9 @@ class Gemv(Op):
                     '(beta * y + alpha * dot(A, x)). y: %s, A: %s, x: %s '
                     % (y.shape, A.shape, x.shape))
 
+            if beta == 0 and check_init_y():
+                y.fill(0)
+
             # Here I suppose that A is in c order. If we don't make it
             #  explicitly as fortran order, scipy 0.7.2 seam to create
             #  a copy in fortran order instead of just reshaping it
@@ -250,10 +272,11 @@ class Gemv(Op):
             out = numpy.dot(A, x)
             if alpha != 1:
                 out *= alpha
-            if beta != 1:
-                out += beta * y
-            else:
-                out += y
+            if beta != 0:
+                if beta != 1:
+                    out += beta * y
+                else:
+                    out += y
             out_storage[0][0] = numpy.asarray(out, dtype=y.dtype)
 
     def infer_shape(self, node, input_shapes):
@@ -1413,7 +1436,8 @@ class GemmOptimizer(Optimizer):
             if new_node is not node:
                 nodelist.append(new_node)
 
-        u = theano.gof.opt.Updater(on_import, None, None)
+        u = theano.gof.opt.Updater(on_import, None, None,
+                                   name="GemmOptimizer")
         fgraph.attach_feature(u)
         while did_something:
             nb_iter += 1
@@ -1443,6 +1467,7 @@ class GemmOptimizer(Optimizer):
                 if new_outputs:
                     new_outputs, old_dot22 = new_outputs
                     assert len(new_outputs) == len(node.outputs)
+                    new_outputs[0].tag.values_eq_approx = values_eq_approx_remove_inf_nan
                     try:
                         fgraph.replace_all_validate_remove(
                             list(zip(node.outputs, new_outputs)),
@@ -2134,6 +2159,10 @@ class BatchedDot(Op):
         _z, = out
         fail = sub["fail"]
 
+        if not config.blas.ldflags:
+            return super(BatchedDot, self).c_code(node, name,
+                                                  inp, out, sub)
+
         # generate contiguity condition
         def contiguous(var, ndim):
             strides = "PyArray_STRIDES(%s)" % var
@@ -2407,6 +2436,8 @@ class BatchedDot(Op):
                 raise NotImplementedError()
         xshp, yshp = shapes
         return [xshp[:-1] + yshp[2:]]
+
+batched_dot = BatchedDot()
 
 
 # from opt import register_specialize, register_canonicalize

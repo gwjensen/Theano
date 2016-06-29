@@ -1,3 +1,6 @@
+from __future__ import absolute_import, print_function, division
+
+import numpy
 import theano
 from theano.tensor.nnet.tests import test_abstract_conv
 from theano.sandbox.cuda import float32_shared_constructor as gpu_shared
@@ -22,29 +25,34 @@ else:
 class TestDnnConv2d(test_abstract_conv.BaseTestConv2d):
     def setUp(self):
         super(TestDnnConv2d, self).setUp()
-        # provide_shape is not used by the CuDNN impementation
+        # provide_shape is not used by the cuDNN impementation
         self.provide_shape = [False]
         self.shared = gpu_shared
 
-    def tcase(self, i, f, s, b, flip, provide_shape):
+    def tcase(self, i, f, s, b, flip, provide_shape, fd=(1, 1)):
+        if fd != (1, 1):
+            raise SkipTest("No dilation implementation for cuDNN ConvOp.")
         if not dnn_available():
             raise SkipTest(cuda.dnn.dnn_available.msg)
         mode = mode_with_gpu
-        o = self.get_output_shape(i, f, s, b)
+        o = self.get_output_shape(i, f, s, b, fd)
         self.run_fwd(inputs_shape=i, filters_shape=f, subsample=s,
                      verify_grad=True, mode=mode,
                      provide_shape=provide_shape, border_mode=b,
-                     filter_flip=flip, target_op=GpuDnnConv)
+                     filter_flip=flip, target_op=GpuDnnConv,
+                     filter_dilation=fd)
         self.run_gradweight(inputs_shape=i, filters_shape=f,
                             output_shape=o, subsample=s,
                             verify_grad=True, mode=mode,
                             provide_shape=provide_shape, border_mode=b,
-                            filter_flip=flip, target_op=GpuDnnConvGradW)
+                            filter_flip=flip, target_op=GpuDnnConvGradW,
+                            filter_dilation=fd)
         self.run_gradinput(inputs_shape=i, filters_shape=f,
                            output_shape=o, subsample=s,
                            verify_grad=True, mode=mode,
                            provide_shape=provide_shape, border_mode=b,
-                           filter_flip=flip, target_op=GpuDnnConvGradI)
+                           filter_flip=flip, target_op=GpuDnnConvGradI,
+                           filter_dilation=fd)
 
 
 class TestCorrMMConv2d(test_abstract_conv.BaseTestConv2d):
@@ -53,28 +61,30 @@ class TestCorrMMConv2d(test_abstract_conv.BaseTestConv2d):
         self.shared = gpu_shared
         self.mode = mode_with_gpu.excluding('cudnn')
 
-    def tcase(self, i, f, s, b, flip, provide_shape):
+    def tcase(self, i, f, s, b, flip, provide_shape, fd=(1, 1)):
         mode = self.mode
-        o = self.get_output_shape(i, f, s, b)
-        self.run_fwd(inputs_shape=i, filters_shape=f, subsample=s,
-                     verify_grad=True, mode=mode,
+        o = self.get_output_shape(i, f, s, b, fd)
+        self.run_fwd(inputs_shape=i, filters_shape=f,
+                     subsample=s, verify_grad=True, mode=mode,
                      provide_shape=provide_shape, border_mode=b,
-                     filter_flip=flip,
-                     target_op=(GpuCorrMM,
-                                GpuCorrMM_gradWeights,
-                                GpuCorrMM_gradInputs))
+                     filter_flip=flip, target_op=(GpuCorrMM,
+                                                  GpuCorrMM_gradWeights,
+                                                  GpuCorrMM_gradInputs),
+                     filter_dilation=fd)
         self.run_gradweight(inputs_shape=i, filters_shape=f,
                             output_shape=o, subsample=s,
                             verify_grad=True, mode=mode,
                             provide_shape=provide_shape, border_mode=b,
                             filter_flip=flip,
-                            target_op=GpuCorrMM_gradWeights)
+                            target_op=GpuCorrMM_gradWeights,
+                            filter_dilation=fd)
         self.run_gradinput(inputs_shape=i, filters_shape=f,
                            output_shape=o, subsample=s,
                            verify_grad=True, mode=mode,
                            provide_shape=provide_shape, border_mode=b,
                            filter_flip=flip,
-                           target_op=GpuCorrMM_gradInputs)
+                           target_op=GpuCorrMM_gradInputs,
+                           filter_dilation=fd)
 
 
 class TestDnnConvTypes(test_abstract_conv.TestConvTypes):
@@ -82,3 +92,5 @@ class TestDnnConvTypes(test_abstract_conv.TestConvTypes):
         self.input = cuda.ftensor4()
         self.filters = cuda.ftensor4()
         self.topgrad = cuda.ftensor4()
+        self.constant_tensor = cuda.CudaNdarray(
+            numpy.zeros((3, 5, 7, 11), dtype='float32'))

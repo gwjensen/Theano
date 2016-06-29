@@ -1,3 +1,4 @@
+from __future__ import absolute_import, print_function, division
 from .nnet import (
     CrossentropyCategorical1Hot, CrossentropyCategorical1HotGrad,
     CrossentropySoftmax1HotWithBiasDx, CrossentropySoftmaxArgmax1HotWithBias,
@@ -34,7 +35,7 @@ from .abstract_conv import conv2d as abstract_conv2d
 
 def conv2d(input, filters, input_shape=None, filter_shape=None,
            border_mode='valid', subsample=(1, 1), filter_flip=True,
-           image_shape=None, **kwargs):
+           image_shape=None, filter_dilation=(1, 1), **kwargs):
     """
     This function will build the symbolic graph for convolving a mini-batch of a
     stack of 2D inputs with a set of 2D filters. The implementation is modelled
@@ -94,6 +95,10 @@ def conv2d(input, filters, input_shape=None, filter_shape=None,
     image_shape: None, tuple/list of len 4 of int or Constant variable
         Deprecated alias for input_shape.
 
+    filter_dilation: tuple of len 2
+        Factor by which to subsample (stride) the input.
+        Also called dilation elsewhere.
+
     kwargs: Any other keyword arguments are accepted for backwards
             compatibility, but will be ignored.
 
@@ -105,7 +110,7 @@ def conv2d(input, filters, input_shape=None, filter_shape=None,
 
     Notes
     -----
-        If CuDNN is available, it will be used on the
+        If cuDNN is available, it will be used on the
         GPU. Otherwise, it is the *CorrMM* convolution that will be used
         "caffe style convolution".
 
@@ -139,4 +144,5 @@ def conv2d(input, filters, input_shape=None, filter_shape=None,
                              " be provided at the same time.")
 
     return abstract_conv2d(input, filters, input_shape, filter_shape,
-                           border_mode, subsample, filter_flip)
+                           border_mode, subsample, filter_flip,
+                           filter_dilation)
